@@ -1,0 +1,31 @@
+{
+  "name": "pocketclaw",
+  "version": "3.0.0",
+  "description": "Android-native autonomous agent engine for Termux",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "pocketclaw": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "files": [
+    "dist/cli.js",
+    "README.md",
+    "env.example"
+  ],
+  "scripts": {
+    "start": "node dist/cli.js start",
+    "dev": "node src/cli.ts",
+    "build": "node scripts/build.mjs",
+    "smoke": "npm run build && node scripts/smoke.mjs",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run smoke"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0"
+  }
+}
