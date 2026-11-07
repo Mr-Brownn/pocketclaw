@@ -1,7 +1,7 @@
 import { chmodSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { dataDir, ensurePrivateDir } from "./utils.ts";
+import { dataDir, ensurePrivateDir, fixOwnership } from "./utils.ts";
 
 export interface MemoryEntry {
   id: number;
@@ -102,6 +102,7 @@ export function getMemoryStore(): Promise<MemoryStore> {
       } catch {
         // best effort
       }
+      fixOwnership(dbPath);
       return new MemoryStore(db);
     })().catch((error) => {
       instance = null;

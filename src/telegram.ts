@@ -9,6 +9,8 @@ import { getSkillManager } from "./skills.ts";
 import { getMCPManager } from "./mcp.ts";
 import { closeMemoryStore } from "./memory.ts";
 import { assessShell } from "./policy.ts";
+import { Scheduler, addTask, describeTask, formatWhen, loadTasks, recordTaskResult, removeTask } from "./scheduler.ts";
+import type { ScheduledTask } from "./scheduler.ts";
 import type { ApprovalRequest } from "./tools.ts";
 import { VERSION, chunkText, errMsg, sleep, truncate } from "./utils.ts";
 
@@ -81,6 +83,7 @@ const COMMAND_MENU = [
   { command: "skills", description: "Installed skills" },
   { command: "mcp", description: "MCP servers and tools" },
   { command: "status", description: "Device and bot status" },
+  { command: "schedule", description: "Reminders and scheduled tasks" },
   { command: "stop", description: "Stop the running task" },
   { command: "reset", description: "Start a fresh session" },
   { command: "exec", description: "Run a shell command: /exec <cmd>" },
@@ -135,6 +138,7 @@ function clip(text: string, max: number): string {
 /** One status message that is edited in place as the agent works (throttled to respect Telegram limits). */
 class Progress {
   private status = "🧠 Starting…";
+  private draft = "";
   private lines: string[] = [];
   private messageId: number | null = null;
   private lastEdit = 0;
@@ -165,11 +169,18 @@ class Progress {
     switch (event.type) {
       case "thinking":
         this.status = `🧠 Thinking… (step ${event.turn}/${event.maxTurns})`;
+        this.draft = "";
+        break;
+      case "text_delta":
+        // The model's reply as it is being written (shown live, then replaced by the final message).
+        this.draft = (this.draft + event.text).slice(-1_200);
         break;
       case "narration":
+        this.draft = "";
         this.add(`🗣 ${esc(clip(event.text, 240))}`);
         break;
       case "tool_start":
+        this.draft = "";
         this.add(esc(clip(event.summary, 200)));
         break;
       case "tool_end":
@@ -187,6 +198,7 @@ class Progress {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     this.status = statusText;
+    this.draft = "";
     this.queueEdit(true);
     await this.chain;
   }
@@ -198,10 +210,12 @@ class Progress {
 
   private render(): string {
     let lines = [...this.lines];
-    let body = `<b>${esc(this.status)}</b>${lines.length ? `\n\n${lines.join("\n")}` : ""}`;
+    const draft = this.draft ? `\n\n✍️ ${esc(this.draft.slice(-500))}` : "";
+    const build = (): string => `<b>${esc(this.status)}</b>${lines.length ? `\n\n${lines.join("\n")}` : ""}${draft}`;
+    let body = build();
     while (body.length > 3_500 && lines.length > 1) {
       lines = lines.slice(1);
-      body = `<b>${esc(this.status)}</b>\n\n${lines.join("\n")}`;
+      body = build();
     }
     return body;
   }
@@ -239,6 +253,7 @@ export class TelegramBot {
   private readonly lastReject = new Map<number, number>();
   private running = false;
   private pollAbort: AbortController | null = null;
+  private scheduler: Scheduler | null = null;
 
   constructor(config: TelegramConfig) {
     if (config.allowedChatIds.length === 0) {
@@ -454,6 +469,30 @@ export class TelegramBot {
           keyboard: [[{ text: "🔄 Refresh", data: "v:mcp" }, ...BACK_ROW]],
         };
       }
+      case "schedule": {
+        const tasks = loadTasks().filter((t) => this.allowed.has(t.chatId));
+        const list = tasks.length
+          ? tasks
+              .map(
+                (t) =>
+                  `${t.kind === "agent" ? "🤖" : "⏰"} <code>${esc(t.id)}</code> · ${esc(t.spec)} · next <code>${esc(formatWhen(t.nextRun))}</code>\n   ${esc(clip(t.text, 100))}${t.lastStatus ? `\n   <i>last: ${esc(clip(t.lastStatus, 80))}</i>` : ""}`
+              )
+              .join("\n")
+          : "No scheduled tasks yet.";
+        return {
+          text: truncate(
+            `📅 <b>Scheduled tasks</b>\n\n${list}\n\n` +
+              `Just ask in plain language, e.g. <i>“remind me in 20 minutes to stretch”</i> or <i>“every morning at 8 send me my battery level”</i>.\n` +
+              `Or: <code>/schedule add in 20m | stretch</code> · <code>/schedule agent daily 08:00 | report battery</code>\n` +
+              `<i>Times are device local time.</i>`,
+            3_500
+          ),
+          keyboard: [
+            ...tasks.slice(0, 8).map((t) => [{ text: `🗑 Cancel ${t.id}`, data: `sc:rm:${t.id}` }]),
+            [{ text: "🔄 Refresh", data: "v:schedule" }, ...BACK_ROW],
+          ],
+        };
+      }
       case "status": {
         let deviceUptime = "n/a";
         let load = "n/a";
@@ -498,7 +537,10 @@ export class TelegramBot {
               { text: "📊 Status", data: "v:status" },
               { text: "🔄 New session", data: "a:reset" },
             ],
-            [{ text: "⏹ Stop task", data: "a:stop" }],
+            [
+              { text: "📅 Schedule", data: "v:schedule" },
+              { text: "⏹ Stop task", data: "a:stop" },
+            ],
           ],
         };
     }
@@ -568,9 +610,9 @@ export class TelegramBot {
     return agent;
   }
 
-  private enqueue(chatId: number, job: () => Promise<void>): void {
+  private enqueue(chatId: number, job: () => Promise<void>, opts: { quiet?: boolean } = {}): void {
     const previous = this.queues.get(chatId);
-    if (previous) {
+    if (previous && !opts.quiet) {
       void this.sendMessage(chatId, "⏳ Queued behind the current task. Send /stop to cancel it.").catch(() => undefined);
     }
     const next = (previous ?? Promise.resolve())
@@ -598,8 +640,12 @@ export class TelegramBot {
     });
   }
 
-  private async runAgent(chatId: number, text: string): Promise<void> {
-    const agent = this.getAgent(chatId);
+  private async runAgent(
+    chatId: number,
+    text: string,
+    opts: { agent?: Agent; scheduled?: boolean; taskId?: string } = {}
+  ): Promise<void> {
+    const agent = opts.agent ?? this.getAgent(chatId);
     const controller = new AbortController();
     this.runs.set(chatId, controller);
     const stopTyping = this.startTyping(chatId);
@@ -609,9 +655,15 @@ export class TelegramBot {
     const started = Date.now();
     let steps = 0;
     const summary = (): string => `${steps} step${steps === 1 ? "" : "s"} · ${fmtMs(Date.now() - started)}`;
+    const record = (status: string): void => {
+      if (opts.taskId) recordTaskResult(opts.taskId, status);
+    };
     try {
       const response = await agent.run(text, {
         signal: controller.signal,
+        stream: true,
+        chatId,
+        scheduled: opts.scheduled,
         confirm: (req) => this.requestApproval(chatId, req, controller.signal),
         onEvent: (event) => {
           if (event.type === "tool_start") steps++;
@@ -620,17 +672,80 @@ export class TelegramBot {
       });
       if (controller.signal.aborted || response === STOPPED_MESSAGE) {
         await progress.finish(`⏹ Stopped · ${summary()}`);
+        record("stopped");
         return;
       }
       await progress.finish(`✅ Done · ${summary()}`);
+      record(`ok · ${clip(response, 60)}`);
       await this.sendMessage(chatId, response);
     } catch (error) {
       await progress.finish(`❌ Failed · ${summary()}`);
+      record(`failed · ${clip(errMsg(error), 60)}`);
       await this.sendMessage(chatId, `❌ Error: ${errMsg(error)}`);
     } finally {
       stopTyping();
       if (this.runs.get(chatId) === controller) this.runs.delete(chatId);
     }
+  }
+
+  // -------------------------------------------------------------- scheduling
+
+  private async onTaskDue(task: ScheduledTask, late: boolean): Promise<void> {
+    if (!this.allowed.has(task.chatId)) {
+      console.warn(`[scheduler] skipping task ${task.id}: chat ${task.chatId} is not on the allowlist`);
+      return;
+    }
+    if (late) {
+      await this.sendMessage(
+        task.chatId,
+        `⏰ Missed while the bot was offline (was due ${formatWhen(task.nextRun)}):\n${task.text}`
+      ).catch(() => undefined);
+      return;
+    }
+    if (task.kind === "reminder") {
+      await this.sendMessage(task.chatId, `⏰ Reminder: ${task.text}`);
+      recordTaskResult(task.id, "delivered");
+      return;
+    }
+    // Agent task: runs in its own fresh conversation, queued behind anything already running in that chat.
+    this.enqueue(
+      task.chatId,
+      async () => {
+        await this.sendMessage(task.chatId, `🤖 Running scheduled task ${task.id}:\n${clip(task.text, 300)}`);
+        await this.runAgent(task.chatId, task.text, { agent: new Agent(), scheduled: true, taskId: task.id });
+      },
+      { quiet: true }
+    );
+  }
+
+  private async handleSchedule(chatId: number, arg: string): Promise<void> {
+    const [sub = "", ...words] = arg.split(/\s+/);
+    const rest = words.join(" ").trim();
+    if (!sub || sub === "list") return this.sendView(chatId, "schedule");
+
+    if (sub === "rm" || sub === "remove" || sub === "cancel") {
+      const task = loadTasks().find((t) => t.id === rest && t.chatId === chatId);
+      await this.sendMessage(chatId, task && removeTask(rest) ? `✅ Cancelled ${rest}.` : `No scheduled task "${rest}" in this chat.`);
+      return;
+    }
+    if (sub === "add" || sub === "agent") {
+      const bar = rest.indexOf("|");
+      if (bar < 0) {
+        await this.sendMessage(
+          chatId,
+          `Usage: /schedule ${sub} <when> | <${sub === "agent" ? "prompt" : "text"}>\nExample: /schedule ${sub} ${sub === "agent" ? "daily 08:00 | report battery and storage" : "in 20m | stretch"}`
+        );
+        return;
+      }
+      try {
+        const task = addTask({ kind: sub === "agent" ? "agent" : "reminder", spec: rest.slice(0, bar), text: rest.slice(bar + 1), chatId });
+        await this.sendMessage(chatId, `✅ Scheduled\n${describeTask(task)}`);
+      } catch (error) {
+        await this.sendMessage(chatId, `❌ ${errMsg(error)}`);
+      }
+      return;
+    }
+    await this.sendMessage(chatId, "Usage: /schedule | /schedule add <when> | <text> | /schedule agent <when> | <prompt> | /schedule rm <id>");
   }
 
   // --------------------------------------------------------------- commands
@@ -713,6 +828,9 @@ export class TelegramBot {
       case "commands":
       case "menu":
         return this.sendView(chatId, "menu");
+      case "schedule":
+      case "remind":
+        return this.handleSchedule(chatId, cmd.name === "remind" ? `add ${cmd.arg}` : cmd.arg);
       case "config":
       case "skills":
       case "mcp":
@@ -798,6 +916,14 @@ export class TelegramBot {
           await this.showView(chatId, messageId, "model");
           break;
         }
+        case "sc": {
+          if (rest[0] === "rm") {
+            const task = loadTasks().find((t) => t.id === rest[1] && t.chatId === chatId);
+            toast = task && removeTask(task.id) ? "Cancelled" : "Task not found";
+          }
+          await this.showView(chatId, messageId, "schedule");
+          break;
+        }
         case "ap": {
           const pending = this.approvals.get(rest[0] ?? "");
           if (!pending) {
@@ -873,6 +999,7 @@ export class TelegramBot {
   public stop(): void {
     if (!this.running) return;
     this.running = false;
+    this.scheduler?.stop();
     this.pollAbort?.abort();
     for (const controller of this.runs.values()) controller.abort();
     for (const pending of [...this.approvals.values()]) pending.settle(false, "⏹ <b>Bot stopped</b>");
@@ -896,6 +1023,9 @@ export class TelegramBot {
 
     this.running = true;
     this.pollAbort = new AbortController();
+    this.scheduler = new Scheduler({ onDue: (task, late) => this.onTaskDue(task, late) });
+    this.scheduler.start();
+    console.log(`📅 scheduler running (${loadTasks().length} task(s))`);
     const onSignal = (): void => {
       console.log("[telegram] shutting down…");
       this.stop();

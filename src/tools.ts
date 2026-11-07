@@ -6,7 +6,9 @@ import { getConfig, maskSecret, updateConfig, validateConfigValue } from "./conf
 import { getSkillManager } from "./skills.ts";
 import { addMcpServer, getMCPManager, getMcpConfig, removeMcpServer, validateServerSpec } from "./mcp.ts";
 import { assessPath, assessShell, expandHome } from "./policy.ts";
-import { errMsg, firstLine, truncate } from "./utils.ts";
+import { addTask, describeTask, formatWhen, loadTasks, parseSchedule, removeTask } from "./scheduler.ts";
+import { TERMUX_TOOLS, buildTermuxCommand, runTermuxApi, termuxApiAvailable } from "./termux.ts";
+import { compactLine, errMsg, firstLine, truncate } from "./utils.ts";
 
 // ------------------------------------------------------------------ types
 
@@ -36,6 +38,10 @@ export interface ToolContext {
   /** Asks the human to approve a risky action. When absent, risky actions are blocked. */
   confirm?: (request: ApprovalRequest) => Promise<boolean>;
   signal?: AbortSignal;
+  /** Telegram chat the conversation belongs to (used as the delivery target for scheduled tasks). */
+  chatId?: number;
+  /** True while a scheduled task is running: it may not create further scheduled tasks. */
+  scheduled?: boolean;
 }
 
 type Handler = (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
@@ -150,10 +156,22 @@ export const BASE_TOOLS: ToolDefinition[] = [
   ),
   tool("remove_mcp_server", "Stop and remove an installed MCP server.", { name: str("Server name.") }, ["name"]),
   tool("list_mcp_servers", "List configured MCP servers with their running status."),
+  tool(
+    "schedule_task",
+    'Schedule a reminder or an autonomous agent task. `when` is one of: "in 20m", "every 2h", "daily 08:00", "weekdays 07:30", "mon,fri 18:00", "at 2026-11-06 14:30" (device local time). Results are delivered to the Telegram chat and only run while the bot daemon is running. Agent tasks need the user\'s approval to create, and risky actions inside them still need approval.',
+    {
+      when: str("When to run (see description)."),
+      text: str("Reminder text, or the prompt the agent should carry out."),
+      kind: { type: "string", enum: ["reminder", "agent"], description: "reminder (default) just sends a message; agent runs the prompt autonomously." },
+    },
+    ["when", "text"]
+  ),
+  tool("list_schedules", "List scheduled reminders and agent tasks with their next run time."),
+  tool("cancel_schedule", "Cancel a scheduled task by its id (see list_schedules).", { id: str("Task id.") }, ["id"]),
 ];
 
 export function getActiveTools(): ToolDefinition[] {
-  return [...BASE_TOOLS, ...getMCPManager().getDiscoveredTools()];
+  return [...BASE_TOOLS, ...(termuxApiAvailable() ? TERMUX_TOOLS : []), ...getMCPManager().getDiscoveredTools()];
 }
 
 export const TOOLS: ToolDefinition[] = BASE_TOOLS;
@@ -455,7 +473,60 @@ const handlerTable: Record<string, Handler> = {
   },
 };
 
-const HANDLERS = new Map<string, Handler>(Object.entries(handlerTable));
+const scheduleHandlers: Record<string, Handler> = {
+  async schedule_task(args, ctx) {
+    if (ctx.scheduled) return fail("Scheduled tasks cannot create further scheduled tasks.", "not allowed");
+    const when = reqStr(args, "when", 100);
+    const text = reqStr(args, "text", 2_000);
+    const rawKind = args.kind ?? "reminder";
+    if (rawKind !== "reminder" && rawKind !== "agent") return fail('Error: "kind" must be "reminder" or "agent"');
+    parseSchedule(when); // fail on a bad schedule before bothering the user with an approval prompt
+
+    if (rawKind === "agent") {
+      const g = await gate(
+        ctx,
+        "schedule_task",
+        `Schedule an autonomous agent task (${when}): ${text}`,
+        "creates a task that will run on its own, unattended"
+      );
+      if (!g.allowed) return fail(g.message, "blocked");
+    }
+    const task = addTask({ kind: rawKind, text, spec: when, chatId: ctx.chatId });
+    return ok(
+      `Scheduled ${task.kind} ${task.id}: ${task.spec}. Next run ${formatWhen(task.nextRun)} (device local time). It only runs while the bot daemon (pocketclaw start) is running.`,
+      `${task.id} · next ${formatWhen(task.nextRun)}`
+    );
+  },
+
+  async list_schedules() {
+    const tasks = loadTasks();
+    return ok(tasks.length ? tasks.map(describeTask).join("\n") : "No scheduled tasks.", `${tasks.length} task${tasks.length === 1 ? "" : "s"}`);
+  },
+
+  async cancel_schedule(args) {
+    const id = reqStr(args, "id", 20);
+    return removeTask(id) ? ok(`Cancelled scheduled task ${id}.`, "cancelled") : fail(`No scheduled task with id ${id}.`, "not found");
+  },
+};
+
+function makeDeviceHandler(name: string): Handler {
+  return async (args, ctx) => {
+    const cmd = buildTermuxCommand(name, args);
+    const g = await gate(ctx, name, cmd.summary, cmd.reason);
+    if (!g.allowed) return fail(g.message, "blocked");
+    const res = await runTermuxApi(cmd, ctx.signal);
+    if (!res.ok) return fail(res.output, compactLine(res.output, 100) || "failed");
+    const body = res.output === "Done." ? "" : res.output;
+    const output = [body, cmd.successNote].filter(Boolean).join("\n") || "Done.";
+    return ok(output, compactLine(output, 100) || "done");
+  };
+}
+
+const HANDLERS = new Map<string, Handler>([
+  ...Object.entries(handlerTable),
+  ...Object.entries(scheduleHandlers),
+  ...TERMUX_TOOLS.map((t): [string, Handler] => [t.function.name, makeDeviceHandler(t.function.name)]),
+]);
 
 async function callMcp(name: string, args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const g = await gate(ctx, name, `Call MCP tool ${name} with ${truncate(JSON.stringify(args), 400)}`, null);
@@ -525,6 +596,34 @@ export function describeToolCall(name: string, args: Record<string, unknown>): s
       return `🔌 Removing MCP server: ${clip(s("name"))}`;
     case "list_mcp_servers":
       return "🔌 Listing MCP servers";
+    case "schedule_task":
+      return `📅 Scheduling ${s("kind") === "agent" ? "an agent task" : "a reminder"} (${clip(s("when"), 40)}): ${clip(s("text"), 80)}`;
+    case "list_schedules":
+      return "📅 Listing scheduled tasks";
+    case "cancel_schedule":
+      return `📅 Cancelling scheduled task ${clip(s("id"), 20)}`;
+    case "device_battery":
+      return "🔋 Reading battery status";
+    case "device_wifi":
+      return "📶 Reading Wi-Fi info";
+    case "device_notify":
+      return `🔔 Showing notification: ${clip(s("title"), 60)}`;
+    case "device_clipboard_get":
+      return "📋 Reading the clipboard";
+    case "device_clipboard_set":
+      return "📋 Setting the clipboard";
+    case "device_torch":
+      return `🔦 Turning the torch ${args.on === true ? "on" : "off"}`;
+    case "device_speak":
+      return `🔊 Speaking: ${clip(s("text"), 80)}`;
+    case "device_vibrate":
+      return "📳 Vibrating";
+    case "device_location":
+      return "📍 Getting location";
+    case "device_camera_photo":
+      return "📷 Taking a photo";
+    case "device_sms_send":
+      return `💬 Sending SMS to ${clip(s("number"), 20)}`;
     default:
       return name.startsWith("mcp_") ? `🔌 Calling MCP tool: ${name.slice(4)}` : `⚙️ Running ${name}`;
   }

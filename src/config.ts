@@ -1,6 +1,6 @@
-import { chmodSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { dataDir, ensurePrivateDir, errMsg } from "./utils.ts";
+import { dataDir, errMsg, writePrivateFile } from "./utils.ts";
 
 export type ConfirmMode = "dangerous" | "always" | "never";
 export const CONFIRM_MODES: ConfirmMode[] = ["dangerous", "always", "never"];
@@ -171,17 +171,8 @@ export function getConfig(): AppConfig {
 }
 
 function persist(cfg: AppConfig): void {
-  const dir = ensurePrivateDir(dataDir());
-  const file = join(dir, "config.json");
-  const tmp = `${file}.tmp`;
   const { apiKey: _neverPersisted, ...rest } = cfg;
-  writeFileSync(tmp, JSON.stringify(rest, null, 2), { encoding: "utf8", mode: 0o600 });
-  renameSync(tmp, file);
-  try {
-    chmodSync(file, 0o600);
-  } catch {
-    // best effort
-  }
+  writePrivateFile(getConfigFilePath(), JSON.stringify(rest, null, 2));
 }
 
 export function updateConfig(updates: Partial<Record<ConfigKey, string | number>>): AppConfig {

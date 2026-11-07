@@ -1,8 +1,8 @@
 import { spawn, spawnSync } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { VERSION, childEnv, dataDir, ensurePrivateDir, errMsg } from "./utils.ts";
+import { VERSION, childEnv, dataDir, errMsg, writePrivateFile } from "./utils.ts";
 
 export interface MCPServerConfig {
   command: string;
@@ -61,16 +61,7 @@ export function getMcpConfig(): MCPConfigFile {
 }
 
 function saveMcpConfig(cfg: MCPConfigFile): void {
-  const dir = ensurePrivateDir(dataDir());
-  const file = join(dir, "mcp.json");
-  const tmp = `${file}.tmp`;
-  writeFileSync(tmp, JSON.stringify(cfg, null, 2), { encoding: "utf8", mode: 0o600 });
-  renameSync(tmp, file);
-  try {
-    chmodSync(file, 0o600);
-  } catch {
-    // best effort
-  }
+  writePrivateFile(mcpConfigPath(), JSON.stringify(cfg, null, 2));
 }
 
 /** Throws a descriptive error when a server definition is not acceptable. */

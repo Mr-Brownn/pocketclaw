@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -48,7 +49,7 @@ await check("tools command lists tool schemas", () => {
   const r = pc(["tools"]);
   const tools = JSON.parse(r.out);
   assert(Array.isArray(tools), "tools output is not an array");
-  for (const name of ["shell", "get_config", "set_config", "create_skill", "add_mcp_server", "forget"]) {
+  for (const name of ["shell", "get_config", "set_config", "create_skill", "add_mcp_server", "forget", "schedule_task", "list_schedules", "cancel_schedule"]) {
     assert(tools.some((t) => t.function.name === name), `${name} tool missing`);
   }
 });
@@ -95,6 +96,28 @@ await check("child processes do not inherit PocketClaw secrets", () => {
   const cmd = IS_WINDOWS ? "echo %LLM_API_KEY%/%TELEGRAM_BOT_TOKEN%" : 'echo "$LLM_API_KEY/$TELEGRAM_BOT_TOKEN"';
   const r = pc(["exec", cmd], { LLM_API_KEY: "supersecret-key-123", TELEGRAM_BOT_TOKEN: "supersecret-token-456" });
   assert(!r.out.includes("supersecret"), "a secret leaked into the child environment");
+});
+
+await check("install-shortcut replaces a symlink instead of writing through it", () => {
+  const prefix = mkdtempSync(join(tmpdir(), "pocketclaw-prefix-"));
+  try {
+    mkdirSync(join(prefix, "bin"));
+    const precious = join(prefix, "program.js");
+    writeFileSync(precious, "// the real program\n");
+    try {
+      symlinkSync(precious, join(prefix, "bin", "pocketclaw"));
+    } catch {
+      return; // creating symlinks needs special rights on some Windows setups: nothing to test there
+    }
+    const r = pc(["install-shortcut"], { PREFIX: prefix });
+    assert(r.code === 0, `exit ${r.code}: ${r.err}`);
+    assert(readFileSync(precious, "utf8") === "// the real program\n", "the symlink target was overwritten");
+    const target = join(prefix, "bin", "pocketclaw");
+    assert(!lstatSync(target).isSymbolicLink(), "shortcut is still a symlink");
+    assert(readFileSync(target, "utf8").includes("exec node"), "shortcut content missing");
+  } finally {
+    rmSync(prefix, { recursive: true, force: true });
+  }
 });
 
 await check("start refuses to run without an allowlist", () => {
@@ -227,6 +250,216 @@ await check("chunkText respects the limit", () => {
   const chunks = lib.chunkText(text, 4000);
   assert(chunks.length > 1 && chunks.every((c) => c.length <= 4000), "chunk too long");
   assert(chunks.join("\n").replace(/\s/g, "") === text.replace(/\s/g, ""), "content lost");
+});
+
+// ----------------------------------------------- fake LLM server: streaming & agent loop
+
+function fakeLLM(responses) {
+  let i = 0;
+  const seen = [];
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (d) => (raw += d));
+    req.on("end", () => {
+      const body = JSON.parse(raw);
+      seen.push(body);
+      const r = responses[Math.min(i++, responses.length - 1)];
+      if (r.status) {
+        res.writeHead(r.status);
+        res.end("nope");
+        return;
+      }
+      if (body.stream) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        const send = (delta) => res.write(`data: ${JSON.stringify({ choices: [{ delta }] })}\n\n`);
+        for (const part of r.content?.match(/.{1,4}/gs) ?? []) send({ content: part });
+        (r.tool_calls ?? []).forEach((tc, idx) => {
+          send({ tool_calls: [{ index: idx, id: tc.id, function: { name: tc.name, arguments: tc.args.slice(0, 5) } }] });
+          send({ tool_calls: [{ index: idx, function: { arguments: tc.args.slice(5) } }] });
+        });
+        res.write("data: [DONE]\n\n");
+        res.end();
+      } else {
+        res.writeHead(200, { "content-type": "application/json" });
+        const tool_calls = r.tool_calls?.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.args } }));
+        res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: r.content ?? null, tool_calls } }] }));
+      }
+    });
+  });
+  return new Promise((resolve) =>
+    server.listen(0, "127.0.0.1", () => resolve({ server, seen, cfg: { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "test-key-12345", model: "fake" } }))
+  );
+}
+
+await check("llm: streamed text arrives in pieces and is assembled", async () => {
+  const fake = await fakeLLM([{ content: "Hello there, friend!" }]);
+  try {
+    const deltas = [];
+    const msg = await lib.chatCompletion([{ role: "user", content: "hi" }], [], fake.cfg, undefined, (d) => deltas.push(d));
+    assert(msg.content === "Hello there, friend!", `content: ${msg.content}`);
+    assert(deltas.length > 1 && deltas.join("") === msg.content, "text did not stream in pieces");
+    assert(fake.seen[0].stream === true, "stream flag not sent");
+  } finally {
+    fake.server.close();
+  }
+});
+
+await check("llm: streamed tool-call fragments are reassembled", async () => {
+  const fake = await fakeLLM([{ tool_calls: [{ id: "c1", name: "shell", args: '{"command":"echo hi"}' }] }]);
+  try {
+    const msg = await lib.chatCompletion([{ role: "user", content: "x" }], [], fake.cfg, undefined, () => {});
+    assert(msg.tool_calls?.[0]?.function.name === "shell", "tool call missing");
+    assert(JSON.parse(msg.tool_calls[0].function.arguments).command === "echo hi", "arguments not reassembled");
+  } finally {
+    fake.server.close();
+  }
+});
+
+await check("llm: a 401 fails immediately without retries", async () => {
+  const fake = await fakeLLM([{ status: 401 }]);
+  try {
+    let error;
+    try {
+      await lib.chatCompletion([{ role: "user", content: "x" }], [], fake.cfg);
+    } catch (e) {
+      error = e;
+    }
+    assert(error && String(error.message).includes("401"), "no 401 error");
+    assert(fake.seen.length === 1, `made ${fake.seen.length} requests`);
+  } finally {
+    fake.server.close();
+  }
+});
+
+await check("agent: full tool-calling loop with streaming events", async () => {
+  const fake = await fakeLLM([
+    { content: "Checking.", tool_calls: [{ id: "c1", name: "shell", args: '{"command":"echo hi"}' }] },
+    { content: "All done." },
+  ]);
+  try {
+    const agent = new lib.Agent();
+    const events = [];
+    const result = await agent.run("say hi", { llmConfig: fake.cfg, stream: true, onEvent: (e) => events.push(e.type) });
+    assert(result === "All done.", `result: ${result}`);
+    const order = events.filter((t) => t !== "text_delta").join(",");
+    assert(order === "thinking,narration,tool_start,tool_end,thinking", `events: ${order}`);
+    assert(events.includes("text_delta"), "no streamed text");
+    const toolMsg = fake.seen[1].messages.at(-1);
+    assert(toolMsg.role === "tool" && toolMsg.content.includes("hi"), "tool result not fed back to the model");
+  } finally {
+    fake.server.close();
+  }
+});
+
+await check("agent: malformed tool arguments are reported to the model, not run", async () => {
+  const fake = await fakeLLM([{ tool_calls: [{ id: "c1", name: "shell", args: "{bad json" }] }, { content: "recovered" }]);
+  try {
+    const result = await new lib.Agent().run("go", { llmConfig: fake.cfg });
+    assert(result === "recovered", `result: ${result}`);
+    assert(String(fake.seen[1].messages.at(-1).content).includes("not valid JSON"), "model was not told about the bad arguments");
+  } finally {
+    fake.server.close();
+  }
+});
+
+await check("agent: cancelling returns cleanly and keeps the history valid", async () => {
+  const fake = await fakeLLM([{ content: "never used" }]);
+  try {
+    const agent = new lib.Agent();
+    const ac = new AbortController();
+    ac.abort();
+    assert((await agent.run("x", { llmConfig: fake.cfg, signal: ac.signal })) === lib.STOPPED_MESSAGE, "not stopped");
+    const loaded = agent.loadHistory([
+      { role: "system", content: "old system prompt" },
+      { role: "user", content: "a" },
+      { role: "assistant", content: null, tool_calls: [{ id: "1", type: "function", function: { name: "shell", arguments: "{}" } }] },
+    ]);
+    assert(loaded === 1, `dangling tool call not trimmed (kept ${loaded})`);
+    assert(agent.getHistory()[0].content !== "old system prompt", "saved system prompt overrode the current one");
+  } finally {
+    fake.server.close();
+  }
+});
+
+// ------------------------------------------------------------ scheduler & device tools
+
+await check("scheduler: schedule parsing", () => {
+  const now = new Date(2026, 10, 6, 10, 0, 0).getTime(); // Fri 6 Nov 2026 10:00 local
+  assert(lib.parseSchedule("in 20m", now).nextRun === now + 20 * 60_000, "in 20m");
+  assert(lib.parseSchedule("every 2h", now).schedule.everyMs === 2 * 3_600_000, "every 2h");
+  const daily = new Date(lib.parseSchedule("daily 08:00", now).nextRun);
+  assert(daily.getDate() === 7 && daily.getHours() === 8 && daily.getMinutes() === 0, `daily 08:00 -> ${daily}`);
+  const sameDay = new Date(lib.parseSchedule("daily 18:30", now).nextRun);
+  assert(sameDay.getDate() === 6 && sameDay.getHours() === 18, "later today");
+  const weekdays = new Date(lib.parseSchedule("weekdays 07:30", now).nextRun); // Friday 10:00 -> Monday
+  assert(weekdays.getDay() === 1 && weekdays.getDate() === 9, `weekdays -> ${weekdays}`);
+  assert(new Date(lib.parseSchedule("at 2026-12-01 14:30", now).nextRun).getMonth() === 11, "at");
+  for (const bad of ["every 10s", "in 1s", "daily 25:00", "tomorrow-ish", "at 2020-01-01 10:00", "in 99999d"]) {
+    let threw = false;
+    try {
+      lib.parseSchedule(bad, now);
+    } catch {
+      threw = true;
+    }
+    assert(threw, `accepted "${bad}"`);
+  }
+});
+
+await check("scheduler: due tasks fire once, repeats advance, stale one-offs are reported late", async () => {
+  const fired = [];
+  const hooks = { onDue: (task, late) => void fired.push({ id: task.id, late }) };
+  const once = lib.addTask({ kind: "reminder", text: "once", spec: "in 10s", chatId: 1 });
+  const every = lib.addTask({ kind: "reminder", text: "every", spec: "every 2m", chatId: 1 });
+  const sched = new lib.Scheduler(hooks);
+  await sched.tick(Date.now() + 11_000);
+  assert(fired.length === 1 && fired[0].id === once.id && !fired[0].late, `first tick: ${JSON.stringify(fired)}`);
+  assert(!lib.loadTasks().some((t) => t.id === once.id), "one-off not removed");
+  assert(lib.loadTasks().some((t) => t.id === every.id), "repeating task removed");
+  await sched.tick(Date.now() + 3 * 60_000);
+  assert(fired.length === 2 && fired[1].id === every.id, "repeating task did not fire");
+  assert(lib.loadTasks().find((t) => t.id === every.id).nextRun > Date.now() + 3 * 60_000, "repeat not advanced");
+  const stale = lib.addTask({ kind: "reminder", text: "stale", spec: "in 10s", chatId: 1 });
+  await sched.tick(Date.now() + 2 * 3_600_000);
+  assert(fired.some((f) => f.id === stale.id && f.late), "stale one-off not flagged late");
+  assert(lib.removeTask(every.id), "cancel failed");
+});
+
+await check("tools: scheduling is gated and cannot be chained from a scheduled run", async () => {
+  const reminder = await lib.executeTool("schedule_task", { when: "in 5m", text: "stretch" }, { chatId: 5 });
+  assert(reminder.ok, reminder.output);
+  const agentTask = await lib.executeTool("schedule_task", { when: "daily 08:00", text: "report", kind: "agent" }, { chatId: 5 });
+  assert(!agentTask.ok && agentTask.output.includes("Blocked"), "agent task created without approval");
+  const approved = await lib.executeTool("schedule_task", { when: "daily 08:00", text: "report", kind: "agent" }, { chatId: 5, confirm: async () => true });
+  assert(approved.ok, approved.output);
+  const chained = await lib.executeTool("schedule_task", { when: "in 5m", text: "again" }, { chatId: 5, scheduled: true });
+  assert(!chained.ok, "a scheduled run created another task");
+  const bad = await lib.executeTool("schedule_task", { when: "whenever", text: "x" }, { chatId: 5 });
+  assert(!bad.ok, "bad schedule accepted");
+  for (const t of lib.loadTasks()) lib.removeTask(t.id);
+});
+
+await check("device tools: arguments are validated and sensitive ones are flagged", () => {
+  assert(lib.buildTermuxCommand("device_battery", {}).argv[0] === "termux-battery-status", "battery");
+  assert(lib.buildTermuxCommand("device_camera_photo", {}).reason, "camera not flagged");
+  assert(lib.buildTermuxCommand("device_location", {}).reason, "location not flagged");
+  assert(lib.buildTermuxCommand("device_sms_send", { number: "+254700000000", text: "hi" }).reason, "sms not flagged");
+  assert(lib.buildTermuxCommand("device_clipboard_set", { text: "-rf; echo" }).stdin === "-rf; echo", "clipboard text must go via stdin");
+  for (const [name, args] of [
+    ["device_sms_send", { number: "12; rm -rf /", text: "x" }],
+    ["device_torch", { on: "yes" }],
+    ["device_location", { provider: "wifi" }],
+    ["device_vibrate", { duration_ms: 999999 }],
+    ["device_notify", { title: "x" }],
+    ["nope", {}],
+  ]) {
+    let threw = false;
+    try {
+      lib.buildTermuxCommand(name, args);
+    } catch {
+      threw = true;
+    }
+    assert(threw, `${name} accepted ${JSON.stringify(args)}`);
+  }
 });
 
 rmSync(home, { recursive: true, force: true });
